@@ -172,3 +172,36 @@ export async function prepareClaudePromptBundle(input: {
     instructionsFilePath,
   };
 }
+
+/**
+ * Link skills into `<CLAUDE_CONFIG_DIR>/skills/` so Claude registers them as
+ * user skills.
+ *
+ * Managed AI connection runs pass `--setting-sources user`, and Claude Code
+ * only reads `.claude/skills` inside an `--add-dir` directory when the
+ * `project` source is enabled. Without this, every enabled skill in the prompt
+ * bundle is silently dropped and `Skill(...)` reports "Unknown skill". The
+ * managed config dir is a disposable per-run home created by the server, so
+ * writing links into it never touches the operator's own Claude config.
+ */
+export async function mountClaudeUserSkills(input: {
+  claudeConfigDir: string;
+  skills: SkillEntry[];
+  onLog: AdapterExecutionContext["onLog"];
+}): Promise<void> {
+  const { claudeConfigDir, skills, onLog } = input;
+  if (!claudeConfigDir || skills.length === 0) return;
+  const skillsHome = path.join(claudeConfigDir, "skills");
+  await fs.mkdir(skillsHome, { recursive: true });
+  for (const entry of skills) {
+    const target = path.join(skillsHome, entry.runtimeName);
+    try {
+      await ensurePaperclipSkillSymlink(entry.source, target);
+    } catch (err) {
+      await onLog(
+        "stderr",
+        `[paperclip] Failed to mount Claude skill "${entry.key}" into ${skillsHome}: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
+}
