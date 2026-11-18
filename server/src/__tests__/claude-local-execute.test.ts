@@ -1502,6 +1502,71 @@ describe("claude execute", () => {
     }
   });
 
+  it("mounts enabled skills as user skills for managed AI connection runs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-managed-skills-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    const skillDir = path.join(root, "skill");
+    const otherSkillDir = path.join(root, "other-skill");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(skillDir);
+    await fs.mkdir(otherSkillDir);
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: test-skill\n---\nEnabled skill.\n");
+    await fs.writeFile(path.join(otherSkillDir, "SKILL.md"), "---\nname: other-skill\n---\nNot enabled.\n");
+    await writeFakeClaudeCommand(commandPath);
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "paperclip-home"));
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "default");
+
+    const run = async (runId: string, managed: boolean) => {
+      const capturePath = path.join(root, `${runId}.json`);
+      const claudeConfigDir = path.join(root, `${runId}-claude-config`);
+      await fs.mkdir(claudeConfigDir, { recursive: true });
+      const result = await execute({
+        runId,
+        agent: { id: "agent-1", companyId: "company-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          ...(managed
+            ? { managedAiConnection: { provider: "anthropic", method: "subscription", identity: "selected-account" } }
+            : {}),
+          paperclipRuntimeSkills: [
+            { key: "company/co/test-skill", runtimeName: "test-skill", source: skillDir },
+            { key: "company/co/other-skill", runtimeName: "other-skill", source: otherSkillDir },
+          ],
+          paperclipSkillSync: { desiredSkills: ["company/co/test-skill"] },
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath, CLAUDE_CONFIG_DIR: claudeConfigDir },
+        },
+        context: {},
+        onLog: async () => {},
+      });
+      expect(result.exitCode).toBe(0);
+      const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+      return { capture, claudeConfigDir };
+    };
+
+    try {
+      const managed = await run("run-managed", true);
+      expect(managed.capture.argv).toEqual(expect.arrayContaining(["--setting-sources", "user"]));
+      expect(managed.capture.claudeConfigDir).toBe(managed.claudeConfigDir);
+      expect(managed.capture.claudeConfigEntries).toContain("skills");
+      const mounted = path.join(managed.claudeConfigDir, "skills");
+      expect((await fs.readdir(mounted)).sort()).toEqual(["test-skill"]);
+      expect(await fs.realpath(path.join(mounted, "test-skill"))).toBe(await fs.realpath(skillDir));
+      // The project-scoped bundle is still passed for non-skill assets.
+      expect(managed.capture.skillEntries).toEqual(["test-skill"]);
+
+      const legacy = await run("run-legacy", false);
+      expect(legacy.capture.argv).not.toContain("--setting-sources");
+      await expect(fs.stat(path.join(legacy.claudeConfigDir, "skills"))).rejects.toThrow();
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("starts a fresh Claude session when the stable prompt bundle changes", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-reset-"));
     const workspace = path.join(root, "workspace");
